@@ -170,3 +170,7 @@ dialog .panel { border: 0; }
   .head-actions { width: 100%; }
   .head-actions .btn { flex: 1; }
 }
+
+/* --- suppression du compte --- */
+.chip-deleted { font-style: italic; color: var(--muted); }
+.del-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; color: var(--ink); }

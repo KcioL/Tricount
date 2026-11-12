@@ -5,10 +5,11 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   getAuth, onAuthStateChanged, createUserWithEmailAndPassword,
-  signInWithEmailAndPassword, sendPasswordResetEmail, signOut
+  signInWithEmailAndPassword, sendPasswordResetEmail, signOut,
+  EmailAuthProvider, reauthenticateWithCredential, deleteUser
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
-  getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, writeBatch, getDocs,
+  getFirestore, collection, doc, getDoc, setDoc, updateDoc, deleteDoc, writeBatch, getDocs, where,
   onSnapshot, query, orderBy, limit
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
@@ -35,6 +36,7 @@ let flashKind = "err";
 let myGroups = [];               // [{id, name, addedAt}] depuis Firestore
 let myGroupsLoaded = false;
 let unsubMyGroups = null;
+let wiping = false;              // suppression du compte en cours
 const groupCache = {};
 const homeSubs = {};
 
@@ -82,28 +84,44 @@ function newId() {
   return Array.from(a, b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
 }
 function shareUrl(id) { return location.origin + location.pathname + "#g-" + id; }
-function nameOf(uid) { return (members[uid] && members[uid].name) || "Ancien membre"; }
+const DELETED_NAME = "Compte supprimé";
+function nameOf(uid) {
+  const m = members[uid];
+  if (!m) return "Ancien membre";
+  return m.deleted ? DELETED_NAME : m.name;
+}
 function isOwner() { return !!(group && me && group.createdBy === me); }
 function isMember() { return !!(me && members[me]); }
 function nameTaken(name, exceptUid) {
   const n = name.toLowerCase();
-  return Object.keys(members).some(uid => uid !== exceptUid && members[uid].name.toLowerCase() === n);
+  return Object.keys(members).some(uid => uid !== exceptUid && !members[uid].deleted && members[uid].name.toLowerCase() === n);
 }
 
 // « Mes groupes » est rangé dans le compte : on le retrouve sur tous ses appareils.
 const myGroupRef = (id) => doc(db, USERS, me, "groups", id);
+// Un groupe « retiré » reste dans la liste avec hidden: true, pour que la suppression
+// du compte retrouve tous les groupes dont on est membre.
 function rememberGroup(id, name, force = false) {
-  if (!me || (!myGroupsLoaded && !force)) return;
+  if (!me || wiping || (!myGroupsLoaded && !force)) return;
   const g = myGroups.find(x => x.id === id);
-  if (g && g.name === name) return;
-  setDoc(myGroupRef(id), { name: String(name).slice(0, 60), addedAt: g ? g.addedAt : Date.now() }).catch(() => {});
+  if (g && g.name === name && !g.hidden) return;
+  setDoc(myGroupRef(id), { name: String(name).slice(0, 60), addedAt: g ? g.addedAt : Date.now(), hidden: false }).catch(() => {});
 }
-function forgetGroup(id) {
-  if (me) deleteDoc(myGroupRef(id)).catch(() => {});
-  myGroups = myGroups.filter(x => x.id !== id);
+function stopWatching(id) {
   if (homeSubs[id]) { homeSubs[id](); delete homeSubs[id]; }
   delete groupCache[id];
 }
+function forgetGroup(id) {           // masquer : on reste membre
+  const g = myGroups.find(x => x.id === id);
+  if (me && g) setDoc(myGroupRef(id), { name: g.name, addedAt: g.addedAt, hidden: true }).catch(() => {});
+  stopWatching(id);
+}
+function dropGroup(id) {             // le groupe n'existe plus
+  if (me) deleteDoc(myGroupRef(id)).catch(() => {});
+  myGroups = myGroups.filter(x => x.id !== id);
+  stopWatching(id);
+}
+const visibleGroups = () => myGroups.filter(g => !g.hidden);
 
 // ---------- calculs (tout est en centimes, indexé par uid) ----------
 function shares(amount, people) {
@@ -153,6 +171,7 @@ function errText(e) {
   if (c === "auth/weak-password") return "Mot de passe trop court : 6 caractères minimum.";
   if (c === "auth/invalid-credential" || c === "auth/wrong-password" || c === "auth/user-not-found" || c === "auth/invalid-login-credentials")
     return "Email ou mot de passe incorrect.";
+  if (c === "auth/requires-recent-login") return "Pour des raisons de sécurité, reconnecte-toi puis réessaie.";
   if (c === "auth/too-many-requests") return "Trop de tentatives. Attends quelques minutes ou réinitialise ton mot de passe.";
   if (c === "auth/network-request-failed") return "Pas de connexion internet. Vérifie ton réseau et réessaie.";
   if (c === "auth/unauthorized-domain") return "Ce site n'est pas autorisé. Ajoute son domaine dans Authentication › Paramètres › Domaines autorisés.";
@@ -214,10 +233,10 @@ function watchMyGroups() {
 }
 
 function watchHomeGroups() {
-  myGroups.forEach(g => {
+  visibleGroups().forEach(g => {
     if (homeSubs[g.id]) return;
     homeSubs[g.id] = onSnapshot(groupRef(g.id), snap => {
-      if (!snap.exists()) { forgetGroup(g.id); if (!current) render(); return; }
+      if (!snap.exists()) { dropGroup(g.id); if (!current) render(); return; }
       groupCache[g.id] = snap.data();
       rememberGroup(g.id, snap.data().name);
       if (!current) render();
@@ -317,7 +336,8 @@ function render() {
 }
 
 function homeView() {
-  const list = !myGroupsLoaded ? `<div class="notice">Chargement de tes groupes…</div>` : myGroups.length ? myGroups.map(g => {
+  const vis = visibleGroups();
+  const list = !myGroupsLoaded ? `<div class="notice">Chargement de tes groupes…</div>` : vis.length ? vis.map(g => {
     const d = groupCache[g.id];
     return `<button class="group-row" data-open="${esc(g.id)}">
       <div class="grow"><h3>${esc(d ? d.name : g.name)}</h3>
@@ -343,7 +363,12 @@ function homeView() {
       <div class="field"><label for="gMe">Ton prénom</label><input class="input" id="gMe" maxlength="30" placeholder="Comment les autres te voient" required></div>
       <div class="error-text" id="gErr" hidden></div>
       <div class="actions"><button class="btn" type="submit">Créer le groupe</button></div>
-    </form>`;
+    </form>
+    <section class="panel">
+      <h2>Mon compte</h2>
+      <p class="hint">Connecté avec <strong>${esc(myEmail)}</strong>.</p>
+      <div class="actions"><button class="btn ghost" data-logout>Me déconnecter</button><button class="btn danger" data-delaccount>Supprimer mon compte</button></div>
+    </section>`;
 }
 
 function authView() {
@@ -468,7 +493,7 @@ function balancesTab(bal, cur) {
       <div class="settle">${plan}</div></section>`;
 }
 
-const LOG_ICON = { join: "＋", add: "€", edit: "✎", delete: "×", rename: "Aa", settle: "⇄" };
+const LOG_ICON = { join: "＋", add: "€", edit: "✎", delete: "×", rename: "Aa", settle: "⇄", leave: "−" };
 function journalTab() {
   if (!logEntries.length) return `<div class="notice">Rien dans le journal pour l'instant.</div>`;
   return `<section class="panel"><h2>Journal</h2>
@@ -491,7 +516,7 @@ function groupTab(g) {
       <div class="share"><input class="input" id="shareLink" readonly value="${esc(shareUrl(current))}"><button class="btn" id="copyLink">Copier le lien</button></div>
     </section>
     <section class="panel"><h2>Membres</h2>
-      <div class="chips">${ids.map(uid => `<span class="chip ${uid === me ? "chip-me" : ""}">${esc(members[uid].name)}${uid === g.createdBy ? " <span class='muted'>· créateur</span>" : ""}</span>`).join("")}</div>
+      <div class="chips">${ids.map(uid => `<span class="chip ${uid === me ? "chip-me" : ""} ${members[uid].deleted ? "chip-deleted" : ""}">${esc(nameOf(uid))}${uid === g.createdBy ? " <span class='muted'>· créateur</span>" : ""}</span>`).join("")}</div>
       <form class="row" id="renameForm" autocomplete="off" style="align-items:flex-end">
         <div class="field" style="flex:3 1 180px"><label for="rName">Mon prénom dans ce groupe</label><input class="input" id="rName" maxlength="30" value="${esc(nameOf(me))}"></div>
         <div style="flex:1 1 100px"><button class="btn ghost" type="submit" style="width:100%">Renommer</button></div>
@@ -499,7 +524,7 @@ function groupTab(g) {
       <div class="error-text" id="rErr" hidden></div>
     </section>
     <section class="panel"><h2>Retirer de mes groupes</h2>
-      <p class="hint">Masque ce groupe dans ta liste. Tu restes membre : rouvre le lien pour le retrouver.</p>
+      <p class="hint">Masque ce groupe dans ta liste. Tu restes membre : rouvre le lien pour le faire réapparaître.</p>
       <div class="actions"><button class="btn ghost" data-forget>Retirer de mes groupes</button></div>
     </section>
     ${isOwner() ? `<section class="panel"><h2>Supprimer le groupe</h2>
@@ -576,6 +601,7 @@ function bind() {
   app.querySelectorAll("[data-open]").forEach(b => b.addEventListener("click", () => { location.hash = "g-" + b.dataset.open; }));
   app.querySelectorAll("[data-home]").forEach(b => b.addEventListener("click", () => { location.hash = ""; }));
   app.querySelectorAll("[data-tab]").forEach(b => b.addEventListener("click", () => { tab = b.dataset.tab; render(); }));
+  app.querySelectorAll("[data-delaccount]").forEach(b => b.addEventListener("click", deleteAccountDialog));
   app.querySelectorAll("[data-invite]").forEach(b => b.addEventListener("click", inviteDialog));
   app.querySelectorAll("[data-add]").forEach(b => b.addEventListener("click", () => expenseDialog(null)));
   app.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => expenseDialog(expenses.find(e => e.id === b.dataset.edit))));
@@ -670,6 +696,107 @@ function confirmDialog(title, text, okLabel, action, danger = true) {
     try { await action(); closeDialog(); }
     catch (e) { const x = document.getElementById("cErr"); x.textContent = errText(e); x.hidden = false; ev.target.disabled = false; }
   };
+}
+
+// ---------- suppression du compte ----------
+function deleteAccountDialog() {
+  showDialog(`
+    <h2>Supprimer mon compte ?</h2>
+    <div class="stack">
+      <p class="muted">Voici ce qui va se passer, sans retour possible :</p>
+      <ul class="del-list">
+        <li>Ton compte <strong>${esc(myEmail)}</strong> et ta liste de groupes sont effacés.</li>
+        <li>Dans chaque groupe, ton prénom est remplacé par « ${DELETED_NAME} ». Tes dépenses restent, sinon les comptes de tes potes seraient faux.</li>
+        <li>Les groupes que tu as créés passent au membre le plus ancien. S'il n'y a que toi dedans, ils sont supprimés.</li>
+        <li>Les entrées du journal qui mentionnent tes changements de prénom sont effacées.</li>
+      </ul>
+      <form id="delForm" class="stack" autocomplete="off">
+        <div class="field"><label for="dPass">Confirme avec ton mot de passe</label><input class="input" type="password" id="dPass" autocomplete="current-password" required></div>
+        <p class="hint" id="dProgress" aria-live="polite"></p>
+        <div class="error-text" id="dErr" hidden></div>
+        <div class="actions"><button type="button" class="btn ghost" id="dCancel">Annuler</button><button class="btn danger" type="submit">Supprimer définitivement</button></div>
+      </form>
+    </div>`);
+  document.getElementById("dCancel").onclick = closeDialog;
+  document.getElementById("delForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const err = document.getElementById("dErr");
+    const progress = document.getElementById("dProgress");
+    const btn = ev.target.querySelector("button[type=submit]");
+    const cancel = document.getElementById("dCancel");
+    err.hidden = true; btn.disabled = true; cancel.disabled = true;
+    try {
+      progress.textContent = "Vérification du mot de passe…";
+      const user = auth.currentUser;
+      await reauthenticateWithCredential(user, EmailAuthProvider.credential(user.email, document.getElementById("dPass").value));
+      // on coupe les écoutes en direct pour qu'elles ne recréent rien pendant le nettoyage
+      wiping = true;
+      location.hash = "";
+      resetSession();
+      await wipeAccountData(t => { progress.textContent = t; });
+      progress.textContent = "Suppression du compte…";
+      await deleteUser(user);
+      wiping = false;
+      closeDialog();
+      flash("Ton compte et tes données ont été supprimés.", "ok");
+    } catch (e) {
+      if (wiping) { wiping = false; if (me && !unsubMyGroups) watchMyGroups(); route(); }
+      progress.textContent = "";
+      err.textContent = errText(e); err.hidden = false;
+      btn.disabled = false; cancel.disabled = false;
+    }
+  };
+}
+
+// Supprime ou anonymise tout ce qui est lié au compte, groupe par groupe.
+async function wipeAccountData(onProgress) {
+  const listSnap = await getDocs(collection(db, USERS, me, "groups"));
+  const gids = listSnap.docs.map(d => d.id);
+  let i = 0;
+  for (const gid of gids) {
+    i++;
+    onProgress(`Groupe ${i} sur ${gids.length}…`);
+    const gSnap = await getDoc(groupRef(gid));
+    if (!gSnap.exists()) continue;
+    const g = gSnap.data();
+    const memSnap = await getDocs(sub(gid, "members"));
+    if (!memSnap.docs.some(d => d.id === me)) continue;   // pas (ou plus) membre
+    const others = memSnap.docs
+      .filter(d => d.id !== me && !d.data().deleted)
+      .sort((a, b) => (a.data().joinedAt || 0) - (b.data().joinedAt || 0));
+
+    if (g.createdBy === me && others.length === 0) {
+      // seul membre actif : on supprime tout le groupe
+      const refs = [];
+      for (const name of ["expenses", "log", "members"]) {
+        (await getDocs(sub(gid, name))).docs.forEach(d => refs.push(d.ref));
+      }
+      for (let k = 0; k < refs.length; k += 400) {
+        const bt = writeBatch(db);
+        refs.slice(k, k + 400).forEach(r => bt.delete(r));
+        await bt.commit();
+      }
+      await deleteDoc(groupRef(gid));
+      continue;
+    }
+
+    // entrées du journal contenant d'anciens prénoms
+    const renames = await getDocs(query(sub(gid, "log"), where("by", "==", me), where("action", "==", "rename")));
+    const bt = writeBatch(db);
+    renames.docs.forEach(d => bt.delete(d.ref));
+    if (g.createdBy === me) {
+      bt.update(groupRef(gid), { createdBy: others[0].id });
+    }
+    bt.update(doc(sub(gid, "members"), me), { name: DELETED_NAME, deleted: true });
+    addLog(bt, gid, "leave", "a supprimé son compte");
+    await bt.commit();
+  }
+  onProgress("Nettoyage de ta liste de groupes…");
+  for (let k = 0; k < listSnap.docs.length; k += 400) {
+    const bt = writeBatch(db);
+    listSnap.docs.slice(k, k + 400).forEach(d => bt.delete(d.ref));
+    await bt.commit();
+  }
 }
 
 function inviteDialog() {
