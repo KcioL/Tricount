@@ -404,8 +404,12 @@ function groupView(g) {
   return `
     <div class="topbar"><button class="link" data-home>← Mes groupes</button><span class="grow"></span><span class="me-pill">${esc(nameOf(me))}</span></div>
     <div class="topbar"><div class="grow"><div class="label">Groupe</div><h1>${esc(g.name)}</h1></div>
-      <button class="btn" data-add>+ Ma dépense</button></div>
+      <div class="head-actions"><button class="btn ghost invite-btn" data-invite>Inviter des potes</button><button class="btn" data-add>+ Ma dépense</button></div></div>
     ${flashBox()}
+    ${ids.length < 2 ? `<section class="invite-banner">
+      <div class="grow"><h3>Tu es seul dans ce groupe</h3><p class="hint">Envoie le lien à tes potes : ils créent leur compte, choisissent leur prénom et ajoutent leurs dépenses.</p></div>
+      <button class="btn" data-invite>Inviter des potes</button>
+    </section>` : ""}
     <div class="summary">
       <div class="stat"><div class="label">Total du groupe</div><div class="v">${fmt(total, cur)}</div></div>
       <div class="stat"><div class="label">Mon solde</div><div class="v ${myBal > 0 ? "pos" : myBal < 0 ? "neg" : ""}">${myBal > 0 ? "+" : ""}${fmt(myBal, cur)}</div></div>
@@ -572,6 +576,7 @@ function bind() {
   app.querySelectorAll("[data-open]").forEach(b => b.addEventListener("click", () => { location.hash = "g-" + b.dataset.open; }));
   app.querySelectorAll("[data-home]").forEach(b => b.addEventListener("click", () => { location.hash = ""; }));
   app.querySelectorAll("[data-tab]").forEach(b => b.addEventListener("click", () => { tab = b.dataset.tab; render(); }));
+  app.querySelectorAll("[data-invite]").forEach(b => b.addEventListener("click", inviteDialog));
   app.querySelectorAll("[data-add]").forEach(b => b.addEventListener("click", () => expenseDialog(null)));
   app.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => expenseDialog(expenses.find(e => e.id === b.dataset.edit))));
 
@@ -664,6 +669,34 @@ function confirmDialog(title, text, okLabel, action, danger = true) {
     ev.target.disabled = true;
     try { await action(); closeDialog(); }
     catch (e) { const x = document.getElementById("cErr"); x.textContent = errText(e); x.hidden = false; ev.target.disabled = false; }
+  };
+}
+
+function inviteDialog() {
+  if (!group) return;
+  const url = shareUrl(current);
+  const canShare = typeof navigator.share === "function";
+  showDialog(`
+    <h2>Inviter des potes</h2>
+    <p class="muted">Envoie ce lien à tes potes. En l'ouvrant, ils créent leur compte (ou se connectent), choisissent leur prénom et rejoignent « ${esc(group.name)} ».</p>
+    <div class="share"><input class="input" id="invLink" readonly value="${esc(url)}"></div>
+    <div class="actions">
+      <button class="btn ghost" id="invClose">Fermer</button>
+      ${canShare ? `<button class="btn ghost" id="invShare">Partager…</button>` : ""}
+      <button class="btn" id="invCopy">Copier le lien</button>
+    </div>
+    <p class="hint" id="invMsg" aria-live="polite"></p>`);
+  const msg = document.getElementById("invMsg");
+  document.getElementById("invClose").onclick = closeDialog;
+  document.getElementById("invCopy").onclick = async () => {
+    const input = document.getElementById("invLink");
+    try { await navigator.clipboard.writeText(url); msg.textContent = "Lien copié. Colle-le dans ta conversation avec tes potes."; }
+    catch (e) { input.focus(); input.select(); msg.textContent = "Le lien est sélectionné : copie-le avec Ctrl+C (ou appui long sur mobile)."; }
+  };
+  const sh = document.getElementById("invShare");
+  if (sh) sh.onclick = async () => {
+    try { await navigator.share({ title: group.name, text: `Rejoins « ${group.name} » sur Comptes de Potes pour partager les dépenses :`, url }); }
+    catch (e) { /* partage annulé */ }
   };
 }
 

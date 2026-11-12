@@ -161,3 +161,12 @@ dialog .panel { border: 0; }
 .account .link { font-size: 13px; }
 .actions .grow { flex: 1; }
 .actions { align-items: center; }
+
+/* --- invitation --- */
+.head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.invite-banner { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 16px 18px; border-radius: 16px; background: var(--accent-soft); border: 1px solid var(--accent); }
+.invite-banner .grow { flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+@media (max-width: 480px) {
+  .head-actions { width: 100%; }
+  .head-actions .btn { flex: 1; }
+}
